@@ -1,5 +1,7 @@
 # Central Package Management Migration Plans
 
+📖 **For the complete guide and overview, see the [main README](../README.md) at the repository root.**
+
 This directory contains four different approaches to documenting the Central Package Management migration process, based on our successful migration of the Axis platform from packages.config to Central Package Management.
 
 ## Available Formats
