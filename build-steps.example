@@ -1,0 +1,184 @@
+package _Self.buildTypes
+
+import jetbrains.buildServer.configs.kotlin.*
+import jetbrains.buildServer.configs.kotlin.buildFeatures.AutoMerge
+import jetbrains.buildServer.configs.kotlin.buildFeatures.commitStatusPublisher
+import jetbrains.buildServer.configs.kotlin.buildFeatures.merge
+import jetbrains.buildServer.configs.kotlin.buildFeatures.vcsLabeling
+import jetbrains.buildServer.configs.kotlin.buildSteps.PowerShellStep
+import jetbrains.buildServer.configs.kotlin.buildSteps.nuGetInstaller
+import jetbrains.buildServer.configs.kotlin.buildSteps.powerShell
+import jetbrains.buildServer.configs.kotlin.triggers.vcs
+
+object GitMain : BuildType({
+    name = "Build Axis"
+    description = "Builds all Axis components"
+
+    allowExternalStatus = true
+    artifactRules = """
+        %system.teamcity.build.workingDir%\MsBuild\DevOps.Installation\bin\Release\** => Installation.zip
+        %system.teamcity.build.workingDir%\Installer\bin\Release\** => Installation.zip
+        %system.teamcity.build.workingDir%\Installer\Application\bin\Release\** => Installation.zip
+        %system.teamcity.build.workingDir%\Presentation\DevOps.UI.Mvc\Output\** => ControlPanel.zip
+        %system.teamcity.build.workingDir%\Presentation\DevOps.ControlPanel\Output\** => ControlPanel.zip
+        %system.teamcity.build.workingDir%\Presentation\DevOps.LR\Output\** => LicencingRepo.zip
+        %system.teamcity.build.workingDir%\Presentation\DevOps.RESTFul\Output\** => RESTFul.zip
+        %system.teamcity.build.workingDir%\Presentation\MYOB.ED.DevOps.BFF.SqlExe\Output\** => BFFSqlExe.zip
+        %system.teamcity.build.workingDir%\Presentation\MYOB.ED.DevOps.LR\Output\** => LicencingRepo.zip
+        %system.teamcity.build.workingDir%\Presentation\MYOB.LicenseService\Output\** => LicenseService.zip
+        %system.teamcity.build.workingDir%\Services\DevOps.JobServices\bin\Release\** => JobServices.zip
+        %system.teamcity.build.workingDir%\Services\DevOps.DebugServer\bin\Release\** => DebugServer.zip
+        %system.teamcity.build.workingDir%\Scripts\axispromote-advancedbusiness.ps1 => axispromote-advancedbusiness.ps1
+        %system.teamcity.build.workingDir%\Scripts\InstallAxisOnEC2.ps1
+        %system.teamcity.build.workingDir%\Scripts\update-axisconfig-in-ec2.ps1
+    """.trimIndent()
+
+    params {
+        param("AWS_DEFAULT_REGION", "ap-southeast-2")
+        param("teamcity.nuget.feed.server", " ")
+        param("env.PATH", """C:\Program Files\dotnet;%env.PATH%""")
+        param("AWS_ACCESS_KEY_ID", "AKIAIYH7IYNHGBCYCU5A")
+        password("AWS_SECRET_ACCESS_KEY", "******")
+    }
+
+    vcs {
+        root(RelativeId("Nzgithub"))
+
+        checkoutMode = CheckoutMode.ON_SERVER
+        cleanCheckout = true
+    }
+
+    steps {
+        powerShell {
+            name = "Patch SharedAssemblyInfo.cs"
+            platform = PowerShellStep.Platform.x86
+            edition = PowerShellStep.Edition.Desktop
+            scriptMode = file {
+                path = "Scripts/assembly-patching/patch-assembly-version-number.ps1"
+            }
+            noProfile = false
+            scriptArgs = "-build_number %build.counter% -build_sha %build.vcs.number%"
+        }
+        nuGetInstaller {
+            toolPath = "%teamcity.tool.NuGet.CommandLine.5.4.0%"
+            projects = "MYOB.ED.DevOps.sln"
+            noCache = true
+            sources = """
+                https://www.nuget.org/api/v2
+                https://nzakledci02.myob.myobcorp.net:8080/guestAuth/app/nuget/v1/FeedService.svc
+            """.trimIndent()
+            updatePackages = updateParams {
+            }
+        }
+        powerShell {
+            name = "Build Axis Applications"
+            platform = PowerShellStep.Platform.x64
+            workingDir = "Scripts"
+            scriptMode = file {
+                path = "Scripts/axisbuild.ps1"
+            }
+            param("jetbrains_powershell_script_code", """
+                ${'$'}scriptpath = Split-Path ${'$'}MyInvocation.MyCommand.Path
+
+                function Build(${'$'}buildFile, ${'$'}directory, ${'$'}target, ${'$'}toolsVersion){
+                    Push-Location ${'$'}scriptpath
+                    Set-Location ${'$'}directory
+                    ${'$'}msb2017 = Resolve-Path "${'$'}{env:ProgramFiles(x86)}\Microsoft Visual Studio\*\*\MSBuild\*\bin\msbuild.exe" -ErrorAction SilentlyContinue
+                    Write-Host "VS2017 MSBuild.exe: " ${'$'}msb2017
+
+                    . ${'$'}msb2017 ${'$'}buildFile /p:RestorePackages=false /p:Configuration=${'$'}target /p:VisualStudioVersion=${'$'}toolsVersion /p:maxcpucount=4
+                    Pop-Location
+                }
+
+                Build .\Axis.build ".\" Release 15.0
+
+                if(${'$'}LastExitCode -gt 0)
+                {
+                    Write-Error ${'$'}_;
+                    exit 1;
+                }
+            """.trimIndent())
+        }
+        powerShell {
+            name = "Axis Application Unit Tests"
+            platform = PowerShellStep.Platform.x86
+            edition = PowerShellStep.Edition.Desktop
+            workingDir = "."
+            scriptMode = file {
+                path = "Scripts/axistest.ps1"
+            }
+            noProfile = false
+            scriptArgs = """
+                -aws_access_key %AWS_ACCESS_KEY_ID%
+                -aws_secret_key %AWS_SECRET_ACCESS_KEY%
+                -aws_region %AWS_DEFAULT_REGION%
+            """.trimIndent()
+            param("jetbrains_powershell_script_code", """Foreach(${'$'}test in (ls -r Tests\*\bin\Debug\*.Unit.Tests.dll | % FullName | sort-object -Unique)){packages\xunit.runner.console.2.2.0\tools\xunit.console.exe ${'$'}test -teamcity}""")
+        }
+        powerShell {
+            name = "Pin Build"
+            platform = PowerShellStep.Platform.x64
+            edition = PowerShellStep.Edition.Desktop
+            workingDir = "Scripts"
+            scriptMode = script {
+                content = """Invoke-WebRequest -UseBasicParsing -Method PUT -Uri "https://nzakledci02.myob.myobcorp.net:8080/guestAuth/app/rest/builds/452143/pin""""
+            }
+            scriptExecMode = PowerShellStep.ExecutionMode.STDIN
+            scriptArgs = """
+                -build_number %teamcity.build.id%
+                -branch_name %teamcity.build.branch%
+                -target_branch_name feature/ADVPF-366-add-teamcity-auto-build-pin-script
+                -host_name %teamcity.serverUrl%
+            """.trimIndent()
+            param("jetbrains_powershell_script_file", "Scripts/axispinteamcitybuild.ps1")
+        }
+    }
+
+    triggers {
+        vcs {
+            branchFilter = """
+                +:<default>
+                master
+                develop
+                +:feature/*
+                +:hotfix/*
+                +:release/*
+                +:bug/*
+                +:dependabot/*
+                +:*/
+            """.trimIndent()
+        }
+    }
+
+    features {
+        vcsLabeling {
+            vcsRootId = "Natasha_NatashaOperations_Nzgithub"
+            branchFilter = ""
+        }
+        commitStatusPublisher {
+            vcsRootExtId = "Natasha_NatashaOperations_Nzgithub"
+            publisher = github {
+                githubUrl = "https://api.github.com"
+                authType = personalToken {
+                    token = "******"
+                }
+            }
+        }
+        merge {
+            enabled = false
+            branchFilter = "+:master"
+            mergePolicy = AutoMerge.MergePolicy.FAST_FORWARD
+        }
+    }
+
+    requirements {
+        exists("MSBuildTools12.0_x64_Path", "RQ_55")
+        exists("teamcity.tool.NuGet.CommandLine.1.7.0.nupkg", "RQ_56")
+        exists("AWSCLI")
+        exists("MSBuildTools14.0_x64_Path")
+        matches("teamcity.agent.name", "ADVB Build Agent 0[48].*", "RQ_58")
+        equals("teamcity.agent.name", "ADVP Build Agent 1")
+    }
+
+    disableSettings("RQ_55", "RQ_56", "RQ_58")
+})
